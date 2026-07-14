@@ -1,0 +1,395 @@
+#!/bin/bash
+
+set -euo pipefail
+
+PROGRAM="not-yet"
+CAFFEINATE_BIN="${NOT_YET_CAFFEINATE_BIN:-/usr/bin/caffeinate}"
+PMSET_BIN="${NOT_YET_PMSET_BIN:-/usr/bin/pmset}"
+ASSERTIONS_BIN="${NOT_YET_ASSERTIONS_BIN:-/usr/bin/pmset}"
+SLEEP_DELAY="${NOT_YET_SLEEP_DELAY:-5}"
+STATE_ROOT="${NOT_YET_STATE_DIR:-${TMPDIR:-/tmp}/${PROGRAM}-${UID}}"
+LOCK_DIR="${STATE_ROOT}/.lock"
+LOCK_HELD=0
+RUN_ID=""
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+SCRIPT_PATH="${SCRIPT_DIR}/$(basename "$0")"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  not-yet hold [--name TEXT] [--sleep-after]
+  not-yet status
+  not-yet run [--name TEXT] -- COMMAND [ARG ...]
+  not-yet sleep
+
+Commands:
+  hold    Hold a foreground wake lease until interrupted with Ctrl-C.
+  status  List active leases and clean stale records.
+  run     Keep the Mac awake exactly while COMMAND is running.
+  sleep   Sleep after a short grace period, only when no leases are active.
+
+Start hold in a persistent TTY command session. Use --sleep-after only when the
+user explicitly wants the Mac put to sleep after this lease ends.
+EOF
+}
+
+die() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  exit 2
+}
+
+ensure_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "macOS is required"
+  [ -x "$CAFFEINATE_BIN" ] || die "caffeinate was not found at $CAFFEINATE_BIN"
+}
+
+validate_single_line() {
+  local label="$1"
+  local value="$2"
+  [ -n "$value" ] || die "$label must not be empty"
+  case "$value" in
+    *$'\n'*|*$'\r'*) die "$label must be a single line" ;;
+  esac
+}
+
+validate_positive_integer() {
+  case "$1" in
+    ''|*[!0-9]*|0) die "sleep delay must be a positive integer" ;;
+  esac
+}
+
+new_uuid() {
+  /usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]'
+}
+
+lease_key() {
+  printf '%s' "$1" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+}
+
+lease_dir() {
+  printf '%s/lease-%s\n' "$STATE_ROOT" "$(lease_key "$1")"
+}
+
+lock_release() {
+  if [ "$LOCK_HELD" -eq 1 ]; then
+    /bin/rm -f "$LOCK_DIR/pid" "$LOCK_DIR/created_at"
+    /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+    LOCK_HELD=0
+  fi
+}
+
+lock_acquire() {
+  local attempt=0
+  local created_at=0
+  local now
+
+  /bin/mkdir -p "$STATE_ROOT"
+  while ! /bin/mkdir "$LOCK_DIR" 2>/dev/null; do
+    if [ -r "$LOCK_DIR/created_at" ]; then
+      created_at="$(<"$LOCK_DIR/created_at")"
+      now="$(/bin/date '+%s')"
+      if [ $((now - created_at)) -gt 30 ]; then
+        /bin/rm -f "$LOCK_DIR/pid" "$LOCK_DIR/created_at"
+        /bin/rmdir "$LOCK_DIR" 2>/dev/null || true
+        continue
+      fi
+    fi
+
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 100 ] || die "could not acquire the state lock"
+    /bin/sleep 0.05
+  done
+
+  printf '%s\n' "$$" > "$LOCK_DIR/pid"
+  /bin/date '+%s' > "$LOCK_DIR/created_at"
+  LOCK_HELD=1
+}
+
+remove_lease_dir() {
+  local dir="$1"
+  /bin/rm -f \
+    "$dir/id" \
+    "$dir/name" \
+    "$dir/pid" \
+    "$dir/started_at" \
+    "$dir/registered_at"
+  /bin/rmdir "$dir" 2>/dev/null || true
+}
+
+active_count_locked() {
+  local dir
+  local count=0
+  for dir in "$STATE_ROOT"/lease-*; do
+    [ -d "$dir" ] || continue
+    count=$((count + 1))
+  done
+  printf '%s\n' "$count"
+}
+
+clean_stale_locked() {
+  local assertions
+  local dir
+  local pid
+  local registered_at
+  local now
+
+  if ! assertions="$("$ASSERTIONS_BIN" -g assertions 2>/dev/null)"; then
+    return 0
+  fi
+
+  for dir in "$STATE_ROOT"/lease-*; do
+    [ -d "$dir" ] || continue
+    pid="$(<"$dir/pid")"
+    registered_at=0
+    [ -r "$dir/registered_at" ] && registered_at="$(<"$dir/registered_at")"
+    now="$(/bin/date '+%s')"
+    if ! printf '%s\n' "$assertions" | /usr/bin/grep -Eq \
+      "pid[[:space:]]+${pid}\\(caffeinate\\):|\\(pid[[:space:]]+${pid}\\)"; then
+      if [ $((now - registered_at)) -gt 2 ]; then
+        remove_lease_dir "$dir"
+      fi
+    fi
+  done
+}
+
+register_lease() {
+  local id="$1"
+  local name="$2"
+  local dir
+  local temp_dir
+
+  validate_single_line "lease ID" "$id"
+  validate_single_line "lease name" "$name"
+
+  lock_acquire
+  clean_stale_locked
+  dir="$(lease_dir "$id")"
+  [ ! -e "$dir" ] || die "lease already exists: $id"
+
+  temp_dir="${STATE_ROOT}/.lease-$(lease_key "$id").$$"
+  /bin/mkdir "$temp_dir"
+  printf '%s\n' "$id" > "$temp_dir/id"
+  printf '%s\n' "$name" > "$temp_dir/name"
+  printf '%s\n' "$$" > "$temp_dir/pid"
+  /bin/date -u '+%Y-%m-%dT%H:%M:%SZ' > "$temp_dir/started_at"
+  /bin/date '+%s' > "$temp_dir/registered_at"
+  /bin/mv "$temp_dir" "$dir"
+  lock_release
+
+  printf 'ACQUIRED id=%s pid=%s name=%s\n' "$id" "$$" "$name"
+}
+
+release_lease() {
+  local id="$1"
+  local dir
+
+  lock_acquire
+  dir="$(lease_dir "$id")"
+  if [ -d "$dir" ] && [ "$(<"$dir/id")" = "$id" ]; then
+    remove_lease_dir "$dir"
+  fi
+  lock_release
+}
+
+sleep_if_idle_after() {
+  local delay="$1"
+  local count
+
+  validate_positive_integer "$delay"
+  /bin/sleep "$delay"
+  lock_acquire
+  count="$(active_count_locked)"
+  if [ "$count" -eq 0 ]; then
+    printf 'SLEEP_REQUESTED active_leases=0\n'
+    lock_release
+    "$PMSET_BIN" sleepnow
+  else
+    printf 'SLEEP_SKIPPED active_leases=%s\n' "$count"
+    lock_release
+  fi
+}
+
+cleanup_on_exit() {
+  local rc=$?
+  trap - EXIT
+  set +e
+  lock_release
+  if [ -n "$RUN_ID" ]; then
+    release_lease "$RUN_ID"
+  fi
+  exit "$rc"
+}
+
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+command_hold() {
+  local id
+  local name="agent job"
+  local sleep_after=0
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name)
+        [ "$#" -ge 2 ] || die "--name requires a value"
+        name="$2"
+        shift 2
+        ;;
+      --sleep-after)
+        sleep_after=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *) die "unknown hold option: $1" ;;
+    esac
+  done
+
+  id="hold:$(new_uuid)"
+  RUN_ID="$id"
+  register_lease "$id" "$name"
+  printf 'HOLDING id=%s control=ctrl-c sleep_after=%s\n' "$id" "$sleep_after"
+
+  exec "$CAFFEINATE_BIN" -is "$SCRIPT_PATH" __hold-controller "$id" "$sleep_after"
+}
+
+command_hold_controller() {
+  local id="$1"
+  local sleep_after="$2"
+  local released=0
+
+  trap 'released=1' INT
+  trap 'released=1' TERM
+  trap 'released=1' HUP
+
+  while [ "$released" -eq 0 ]; do
+    set +e
+    /bin/sleep 3600
+    set -e
+  done
+
+  release_lease "$id"
+  printf 'RELEASED id=%s\n' "$id"
+  if [ "$sleep_after" -eq 1 ]; then
+    printf 'SLEEP_PENDING delay=%ss if-idle=true\n' "$SLEEP_DELAY"
+    sleep_if_idle_after "$SLEEP_DELAY"
+  fi
+}
+
+command_status() {
+  local dir
+  local count
+
+  lock_acquire
+  clean_stale_locked
+  count="$(active_count_locked)"
+  if [ "$count" -eq 0 ]; then
+    printf 'IDLE active_leases=0\n'
+  else
+    printf 'AWAKE active_leases=%s\n' "$count"
+    for dir in "$STATE_ROOT"/lease-*; do
+      [ -d "$dir" ] || continue
+      printf 'id=%s pid=%s started=%s name=%s\n' \
+        "$(<"$dir/id")" \
+        "$(<"$dir/pid")" \
+        "$(<"$dir/started_at")" \
+        "$(<"$dir/name")"
+    done
+  fi
+  lock_release
+}
+
+command_run() {
+  local name="wrapped command"
+  local id
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name)
+        [ "$#" -ge 2 ] || die "--name requires a value"
+        name="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *) die "unknown run option before --: $1" ;;
+    esac
+  done
+  [ "$#" -gt 0 ] || die "run requires a command after --"
+
+  id="run:$(new_uuid)"
+  RUN_ID="$id"
+  register_lease "$id" "$name"
+  exec "$CAFFEINATE_BIN" -is "$SCRIPT_PATH" __run-controller "$id" "$@"
+}
+
+command_run_controller() {
+  local id="$1"
+  local rc
+  shift
+
+  RUN_ID="$id"
+  set +e
+  "$@"
+  rc=$?
+  set -e
+
+  release_lease "$RUN_ID"
+  RUN_ID=""
+  return "$rc"
+}
+
+command_sleep() {
+  local count
+
+  lock_acquire
+  clean_stale_locked
+  count="$(active_count_locked)"
+  lock_release
+
+  if [ "$count" -ne 0 ]; then
+    printf 'SLEEP_REFUSED active_leases=%s\n' "$count" >&2
+    return 4
+  fi
+  printf 'SLEEP_PENDING delay=%ss if-idle=true\n' "$SLEEP_DELAY"
+  sleep_if_idle_after "$SLEEP_DELAY"
+}
+
+main() {
+  local command
+
+  [ "$#" -gt 0 ] || { usage; exit 2; }
+  ensure_macos
+  command="$1"
+  shift
+
+  case "$command" in
+    hold) command_hold "$@" ;;
+    __hold-controller)
+      [ "$#" -eq 2 ] || die "internal hold controller requires an id and sleep flag"
+      command_hold_controller "$1" "$2"
+      ;;
+    __run-controller)
+      [ "$#" -ge 2 ] || die "internal run controller requires an id and command"
+      command_run_controller "$@"
+      ;;
+    status) [ "$#" -eq 0 ] || die "status takes no arguments"; command_status ;;
+    run) command_run "$@" ;;
+    sleep) [ "$#" -eq 0 ] || die "sleep takes no arguments"; command_sleep ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

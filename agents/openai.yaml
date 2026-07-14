@@ -1,0 +1,4 @@
+interface:
+  display_name: "Not Yet"
+  short_description: "Keep macOS awake for the life of a job"
+  default_prompt: "Use $not-yet to keep this Mac awake until the current job is finished."
